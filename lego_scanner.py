@@ -315,6 +315,28 @@ def scan_new_sets(seen):
             print("Fehler bei Deal", d.get("title", "?")[:60], ":", e)
 
 
+def gemini_generate(client, contents, retries=3):
+    """Gemini-Aufruf mit Wiederholung bei vorübergehenden Fehlern (503 überlastet, 429 Limit)."""
+    last_err = None
+    for attempt in range(retries):
+        try:
+            return client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json"
+                ),
+            )
+        except Exception as e:
+            last_err = e
+            msg = str(e)
+            temporary = any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+            if not temporary or attempt == retries - 1:
+                raise
+            time.sleep(5 * (attempt + 1))  # 5 s, 10 s
+    raise last_err
+
+
 # ==========================================
 # MODUL 2: GEBRAUCHTWARE KI-SCANNER (Kleinanzeigen / eBay Alerts)
 # ==========================================
@@ -412,13 +434,7 @@ def scan_used_lots(seen):
                     except Exception:
                         pass
 
-                ai_res = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=contents,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    ),
-                )
+                ai_res = gemini_generate(client, contents)
                 if not ai_res.text:
                     continue  # nicht als gesehen markieren, nächster Lauf versucht es erneut
                 result = json.loads(ai_res.text)
