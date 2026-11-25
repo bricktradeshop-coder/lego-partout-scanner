@@ -268,7 +268,6 @@ def scan_used_lots(seen):
                 "Antworte AUSSCHLIESSLICH im folgenden JSON-Format:\n"
                 '{"is_good_deal": true/false, "title": "Kurzer Titel des Angebots", "price": "Preis aus Mail", '
                 '"reason": "Warum es ein guter Deal ist (Figuren, Kilopreis, Themenwelt)", '
-Verwende Code mit Vorsicht.
 '"reply_message": "Kurze, freundliche Kaufnachricht zum Kopieren an den Verkäufer"}\n\n'
 f"Betreff: {subject}\nInhalt: {clean_text}"
 )
