@@ -3,19 +3,17 @@ import re
 import json
 import time
 import html
+import base64
 import hashlib
 import imaplib
 import email
 from email.header import decode_header
 import requests
 import xml.etree.ElementTree as ET
-from google import genai
-from google.genai import types
 
 REBRICKABLE_KEY = os.environ["REBRICKABLE_KEY"]
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
@@ -26,9 +24,26 @@ MYDEALZ_RSS_URL = (
 )  # leerer String (z.B. nicht gesetztes GitHub-Secret) -> Default
 BRICKMERGE_TG_CHANNEL = os.environ.get("BRICKMERGE_TG_CHANNEL", "").strip().lstrip("@")
 
-# Gemini-Modell: gemini-2.5-flash ist für neue Nutzer nicht mehr verfügbar.
-# Bei Bedarf per Env-Variable GEMINI_MODEL überschreiben (leer -> Default).
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
+# ---- KI-Anbieter (für die Gebrauchtware-Bewertung) ----
+# AI_PROVIDER: "gemini" (Default), "anthropic" oder "openai"
+# AI_MODEL: optional, überschreibt das Standardmodell des Anbieters
+AI_PROVIDER = os.environ.get("AI_PROVIDER", "").strip().lower() or "gemini"
+AI_KEY_ENV = {
+    "gemini": "GEMINI_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
+}
+AI_DEFAULT_MODEL = {
+    "gemini": "gemini-3.8-flash",
+    "anthropic": "claude-haiku-5-5",
+    "openai": "gpt-4o-mini",  # bitte prüfen, ob für dich aktuell/verfügbar
+}
+AI_API_KEY = os.environ.get(AI_KEY_ENV.get(AI_PROVIDER, ""), "").strip()
+AI_MODEL = os.environ.get("AI_MODEL", "").strip() or AI_DEFAULT_MODEL.get(AI_PROVIDER, "")
+
+# Vorfilter: Mails ohne das Wort "lego" gar nicht erst an die KI schicken (spart Kosten).
+# Abschalten mit USED_PREFILTER=0
+USED_PREFILTER = os.environ.get("USED_PREFILTER", "1").strip() != "0"
 
 HISTORY_FILE = "seen_deals.json"
 MAX_HISTORY = 3000
@@ -315,36 +330,127 @@ def scan_new_sets(seen):
             print("Fehler bei Deal", d.get("title", "?")[:60], ":", e)
 
 
-def gemini_generate(client, contents, retries=3):
-    """Gemini-Aufruf mit Wiederholung bei vorübergehenden Fehlern (503 überlastet, 429 Limit)."""
-    last_err = None
+IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def make_ai_client():
+    """Erzeugt den Client des gewählten Anbieters (SDK wird erst hier importiert)."""
+    if AI_PROVIDER == "gemini":
+        from google import genai
+
+        return genai.Client(api_key=AI_API_KEY)
+    if AI_PROVIDER == "anthropic":
+        import anthropic
+
+        return anthropic.Anthropic(api_key=AI_API_KEY)
+    if AI_PROVIDER == "openai":
+        import openai
+
+        return openai.OpenAI(api_key=AI_API_KEY)
+    raise ValueError(f"Unbekannter AI_PROVIDER: {AI_PROVIDER!r} (erlaubt: gemini, anthropic, openai)")
+
+
+def extract_json(text):
+    """JSON aus der Antwort holen, auch wenn der Anbieter ```json-Zäune oder Text drumherum liefert."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except Exception:
+        m = re.search(r"\{.*\}", text, re.DOTALL)
+        if not m:
+            return None
+        try:
+            data = json.loads(m.group(0))
+        except Exception:
+            return None
+    if isinstance(data, list):
+        data = data[0] if data else None
+    return data if isinstance(data, dict) else None
+
+
+def call_provider(client, prompt, image=None):
+    """Ein einzelner KI-Aufruf. image = (bytes, mime) oder None. Gibt den Antworttext zurück."""
+    if image and image[1] not in IMAGE_MIMES:
+        image = None
+
+    if AI_PROVIDER == "gemini":
+        from google.genai import types
+
+        contents = [prompt]
+        if image:
+            contents.append(types.Part.from_bytes(data=image[0], mime_type=image[1]))
+        res = client.models.generate_content(
+            model=AI_MODEL,
+            contents=contents,
+            config=types.GenerateContentConfig(response_mime_type="application/json"),
+        )
+        return res.text
+
+    b64 = base64.b64encode(image[0]).decode("ascii") if image else None
+
+    if AI_PROVIDER == "anthropic":
+        content = []
+        if image:
+            content.append(
+                {"type": "image", "source": {"type": "base64", "media_type": image[1], "data": b64}}
+            )
+        content.append({"type": "text", "text": prompt})
+        res = client.messages.create(
+            model=AI_MODEL,
+            max_tokens=1000,
+            messages=[{"role": "user", "content": content}],
+        )
+        return "".join(b.text for b in res.content if getattr(b, "type", "") == "text")
+
+    if AI_PROVIDER == "openai":
+        content = [{"type": "text", "text": prompt}]
+        if image:
+            content.append(
+                {"type": "image_url", "image_url": {"url": f"data:{image[1]};base64,{b64}"}}
+            )
+        res = client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[{"role": "user", "content": content}],
+            response_format={"type": "json_object"},
+        )
+        return res.choices[0].message.content
+
+    raise ValueError(f"Unbekannter AI_PROVIDER: {AI_PROVIDER!r}")
+
+
+TEMP_ERRORS = ("503", "429", "529", "UNAVAILABLE", "RESOURCE_EXHAUSTED", "overloaded", "rate limit")
+
+
+def ai_analyze(client, prompt, image=None, retries=3):
+    """KI-Aufruf mit Wiederholung bei vorübergehenden Fehlern. Gibt ein dict oder None zurück."""
     for attempt in range(retries):
         try:
-            return client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    response_mime_type="application/json"
-                ),
-            )
+            return extract_json(call_provider(client, prompt, image))
         except Exception as e:
-            last_err = e
-            msg = str(e)
-            temporary = any(c in msg for c in ("503", "429", "UNAVAILABLE", "RESOURCE_EXHAUSTED"))
+            temporary = any(t.lower() in str(e).lower() for t in TEMP_ERRORS)
             if not temporary or attempt == retries - 1:
                 raise
             time.sleep(5 * (attempt + 1))  # 5 s, 10 s
-    raise last_err
+
+
+def looks_like_lego(subject, text):
+    return "lego" in f"{subject} {text}".lower()
 
 
 # ==========================================
 # MODUL 2: GEBRAUCHTWARE KI-SCANNER (Kleinanzeigen / eBay Alerts)
 # ==========================================
 def scan_used_lots(seen):
-    if not (GEMINI_API_KEY and GMAIL_USER and GMAIL_APP_PASSWORD):
+    if not (AI_API_KEY and GMAIL_USER and GMAIL_APP_PASSWORD):
         return
 
-    client = genai.Client(api_key=GEMINI_API_KEY)
+    try:
+        client = make_ai_client()
+    except Exception as e:
+        print("KI-Client Fehler:", e)
+        return
     mail = None
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
@@ -407,6 +513,11 @@ def scan_used_lots(seen):
                     mail.store(e_id, "+FLAGS", "\\Seen")
                     continue
 
+                if USED_PREFILTER and not looks_like_lego(subject, clean_text):
+                    seen.add(unique_key)
+                    mail.store(e_id, "+FLAGS", "\\Seen")
+                    continue
+
                 prompt = (
                     "Du bist ein erfahrener LEGO Part-Out-Ankäufer. Analysiere diese Suchauftrags-Mail von Kleinanzeigen/eBay.\n"
                     "Prüfe:\n"
@@ -420,26 +531,19 @@ def scan_used_lots(seen):
                     '"reply_message": "Kurze, freundliche Kaufnachricht zum Kopieren an den Verkäufer"}\n\n'
                     f"Betreff: {subject}\nInhalt: {clean_text}"
                 )
-                contents = [prompt]
+                image = None
                 if img_urls:
                     try:
                         img_res = requests.get(html.unescape(img_urls[0]), timeout=10)
                         if img_res.status_code == 200:
-                            mime = img_res.headers.get("Content-Type", "image/jpeg").split(";")[0]
-                            if not mime.startswith("image/"):
-                                mime = "image/jpeg"
-                            contents.append(
-                                types.Part.from_bytes(data=img_res.content, mime_type=mime)
-                            )
+                            mime = img_res.headers.get("Content-Type", "image/jpeg").split(";")[0].strip()
+                            image = (img_res.content, mime if mime.startswith("image/") else "image/jpeg")
                     except Exception:
                         pass
 
-                ai_res = gemini_generate(client, contents)
-                if not ai_res.text:
+                result = ai_analyze(client, prompt, image)
+                if result is None:
                     continue  # nicht als gesehen markieren, nächster Lauf versucht es erneut
-                result = json.loads(ai_res.text)
-                if isinstance(result, list):
-                    result = result[0] if result else {}
 
                 seen.add(unique_key)
                 mail.store(e_id, "+FLAGS", "\\Seen")
