@@ -89,7 +89,20 @@ def esc(s):
     return html.escape(str(s), quote=False)
 
 
+_tg_down = False  # wird True, wenn Telegram dauerhaft nicht erreichbar ist (falscher Token, Netzfehler)
+
+
+def _plain(msg):
+    """HTML-Nachricht in reinen Text umwandeln (Links bleiben als URL erhalten)."""
+    msg = re.sub(r'<a href="([^"]*)">(.*?)</a>', r"\2: \1", msg, flags=re.DOTALL)
+    return html.unescape(re.sub(r"<[^>]+>", "", msg))
+
+
 def send_telegram(msg):
+    """Sendet eine Nachricht. Gibt True zurück, wenn Telegram sie angenommen hat."""
+    global _tg_down
+    if _tg_down:
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         r = requests.post(
@@ -102,12 +115,23 @@ def send_telegram(msg):
             },
             timeout=15,
         )
+        if r.status_code == 400:
+            # Formatierungsfehler (z.B. kaputtes HTML aus KI-Text): als reinen Text erneut senden
+            print("Telegram 400, sende als reinen Text:", r.text[:150])
+            r = requests.post(
+                url,
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": _plain(msg)[:4000]},
+                timeout=15,
+            )
         if r.status_code != 200:
             print("Telegram Fehler:", r.status_code, r.text[:200])
+            if r.status_code in (401, 403, 404):  # Token/Chat-ID falsch oder Bot blockiert
+                _tg_down = True
             return False
         return True
     except Exception as e:
         print("Telegram Fehler:", e)
+        _tg_down = True
         return False
 
 
@@ -291,8 +315,8 @@ def scan_new_sets(seen):
             fig_bonus = total_figs * (5.50 if is_hot_theme else 4.00)
             est_pov = d["bm_pov"] if d["bm_pov"] else ((num_parts * 0.10) + fig_bonus)
 
-            seen.add(deal_id)
             if est_pov <= 0 or d["price"] <= 0:
+                seen.add(deal_id)
                 continue
 
             margin_ratio = d["price"] / est_pov
@@ -301,6 +325,7 @@ def scan_new_sets(seen):
             is_fig_goldmine = total_figs >= 3 and (d["price"] / total_figs) <= 4.50
 
             if not (is_good_pov or is_fig_goldmine):
+                seen.add(deal_id)
                 continue
 
             badge = (
@@ -325,7 +350,8 @@ def scan_new_sets(seen):
                 f"🧱 <b>Teile:</b> {num_parts} Stück\n\n"
                 f'🔗 <a href="{html.escape(d["link"], quote=True)}">Direkt zum Angebot</a>'
             )
-            send_telegram(msg)
+            if send_telegram(msg):
+                seen.add(deal_id)  # erst nach erfolgreichem Senden als gesehen markieren
         except Exception as e:
             print("Fehler bei Deal", d.get("title", "?")[:60], ":", e)
 
@@ -531,6 +557,9 @@ def scan_used_lots(seen):
                     '"reply_message": "Kurze, freundliche Kaufnachricht zum Kopieren an den Verkäufer"}\n\n'
                     f"Betreff: {subject}\nInhalt: {clean_text}"
                 )
+                if _tg_down:
+                    break  # Telegram nicht erreichbar: keine KI-Kosten verursachen, nächster Lauf versucht es erneut
+
                 image = None
                 if img_urls:
                     try:
@@ -545,9 +574,6 @@ def scan_used_lots(seen):
                 if result is None:
                     continue  # nicht als gesehen markieren, nächster Lauf versucht es erneut
 
-                seen.add(unique_key)
-                mail.store(e_id, "+FLAGS", "\\Seen")
-
                 if result.get("is_good_deal"):
                     best_link = html.unescape(ad_links[0]) if ad_links else "https://www.kleinanzeigen.de"
                     telegram_msg = (
@@ -558,7 +584,11 @@ def scan_used_lots(seen):
                         f"💬 <b>Direkt-Nachricht (zum Kopieren):</b>\n{esc(result.get('reply_message', ''))}\n\n"
                         f'🔗 <a href="{html.escape(best_link, quote=True)}">Inserat öffnen</a>'
                     )
-                    send_telegram(telegram_msg)
+                    if not send_telegram(telegram_msg):
+                        continue  # Senden fehlgeschlagen: Mail bleibt ungelesen, nächster Lauf versucht es erneut
+
+                seen.add(unique_key)
+                mail.store(e_id, "+FLAGS", "\\Seen")
             except Exception as e:
                 print("Fehler bei Mail", e_id, ":", e)
     except Exception as e:
