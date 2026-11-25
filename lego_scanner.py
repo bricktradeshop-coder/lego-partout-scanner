@@ -20,8 +20,15 @@ GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
 # Diese beiden URLs bitte an deine echten Quellen anpassen (Env-Variablen oder hier direkt):
-MYDEALZ_RSS_URL = os.environ.get("MYDEALZ_RSS_URL", "https://www.mydealz.de/rss/gruppe/lego")
-BRICKMERGE_TG_CHANNEL = os.environ.get("BRICKMERGE_TG_CHANNEL", "")  # Kanalname ohne @
+MYDEALZ_RSS_URL = (
+    os.environ.get("MYDEALZ_RSS_URL", "").strip()
+    or "https://www.mydealz.de/rss/gruppe/lego"
+)  # leerer String (z.B. nicht gesetztes GitHub-Secret) -> Default
+BRICKMERGE_TG_CHANNEL = os.environ.get("BRICKMERGE_TG_CHANNEL", "").strip().lstrip("@")
+
+# Gemini-Modell: gemini-2.5-flash ist für neue Nutzer nicht mehr verfügbar.
+# Bei Bedarf per Env-Variable GEMINI_MODEL überschreiben (leer -> Default).
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 
 HISTORY_FILE = "seen_deals.json"
 MAX_HISTORY = 3000
@@ -406,7 +413,7 @@ def scan_used_lots(seen):
                         pass
 
                 ai_res = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model=GEMINI_MODEL,
                     contents=contents,
                     config=types.GenerateContentConfig(
                         response_mime_type="application/json"
