@@ -1,0 +1,39 @@
+name: LEGO 24/7 Part-Out Scanner
+
+on:
+  schedule:
+    - cron: '*/15 * * * *' # Läuft automatisch alle 15 Minuten rund um die Uhr
+  workflow_dispatch: # Ermöglicht dir jederzeit einen manuellen Test-Start
+
+permissions:
+  contents: write
+
+jobs:
+  run-scanner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repository laden
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Pakete installieren
+        run: pip install requests
+
+      - name: Scanner ausführen
+        env:
+          REBRICKABLE_KEY: ${{ secrets.REBRICKABLE_KEY }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python scanner.py
+
+      - name: Gesehene Deals speichern (Anti-Duplikat)
+        run: |
+          git config user.name "LEGO Bot"
+          git config user.email "bot@://github.com"
+          git add seen_deals.json || true
+          git commit -m "Update seen deals" || exit 0
+          git push
