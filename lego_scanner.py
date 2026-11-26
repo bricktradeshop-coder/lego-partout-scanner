@@ -45,6 +45,9 @@ AI_MODEL = os.environ.get("AI_MODEL", "").strip() or AI_DEFAULT_MODEL.get(AI_PRO
 # Abschalten mit USED_PREFILTER=0
 USED_PREFILTER = os.environ.get("USED_PREFILTER", "1").strip() != "0"
 
+# Bei jedem Lauf eine (stumme) Status-Nachricht senden. Abschalten mit NOTIFY_EVERY_RUN=0
+NOTIFY_EVERY_RUN = os.environ.get("NOTIFY_EVERY_RUN", "1").strip() != "0"
+
 HISTORY_FILE = "seen_deals.json"
 MAX_HISTORY = 3000
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36"}
@@ -89,6 +92,18 @@ def esc(s):
     return html.escape(str(s), quote=False)
 
 
+STATS = {
+    "mydealz": 0, "brickmerge": 0, "new": 0, "unresolved": 0, "rated": 0, "sent": 0,
+    "used": "nicht geprüft", "mail_unread": 0, "mail_filtered": 0, "mail_rated": 0, "mail_sent": 0,
+    "warnings": [],
+}
+
+
+def warn(text):
+    print(text)
+    STATS["warnings"].append(str(text)[:150])
+
+
 _tg_down = False  # wird True, wenn Telegram dauerhaft nicht erreichbar ist (falscher Token, Netzfehler)
 
 
@@ -98,7 +113,7 @@ def _plain(msg):
     return html.unescape(re.sub(r"<[^>]+>", "", msg))
 
 
-def send_telegram(msg):
+def send_telegram(msg, silent=False):
     """Sendet eine Nachricht. Gibt True zurück, wenn Telegram sie angenommen hat."""
     global _tg_down
     if _tg_down:
@@ -112,6 +127,7 @@ def send_telegram(msg):
                 "text": msg[:4000],
                 "parse_mode": "HTML",
                 "disable_web_page_preview": False,
+                "disable_notification": silent,
             },
             timeout=15,
         )
@@ -120,7 +136,7 @@ def send_telegram(msg):
             print("Telegram 400, sende als reinen Text:", r.text[:150])
             r = requests.post(
                 url,
-                json={"chat_id": TELEGRAM_CHAT_ID, "text": _plain(msg)[:4000]},
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": _plain(msg)[:4000], "disable_notification": silent},
                 timeout=15,
             )
         if r.status_code != 200:
@@ -168,7 +184,7 @@ def rb_get(path, retries=3):
         try:
             r = requests.get(f"{RB_BASE}{path}", headers=headers, timeout=15)
         except Exception as e:
-            print("Rebrickable Fehler:", e)
+            warn(f"Rebrickable Fehler: {e}")
             return None
         time.sleep(1.1)  # Rate-Limit ~1 Request/Sekunde
         if r.status_code == 429:
@@ -209,7 +225,7 @@ def fetch_mydealz():
     try:
         r = requests.get(MYDEALZ_RSS_URL, headers=UA, timeout=15)
         if r.status_code != 200:
-            print("mydealz Status:", r.status_code)
+            warn(f"mydealz: HTTP {r.status_code}")
             return deals
         root = ET.fromstring(r.content)
         for item in root.findall(".//item")[:15]:
@@ -237,7 +253,7 @@ def fetch_mydealz():
                     }
                 )
     except Exception as e:
-        print("mydealz Fehler:", e)
+        warn(f"mydealz Fehler: {e}")
     return deals
 
 
@@ -248,7 +264,7 @@ def fetch_brickmerge():
     try:
         r = requests.get(f"https://t.me/s/{BRICKMERGE_TG_CHANNEL}", headers=UA, timeout=15)
         if r.status_code != 200:
-            print("brickmerge Status:", r.status_code)
+            warn(f"brickmerge: HTTP {r.status_code}")
             return deals
         messages = r.text.split("tgme_widget_message_text")[-10:]
         for msg in messages:
@@ -277,12 +293,23 @@ def fetch_brickmerge():
                 }
             )
     except Exception as e:
-        print("brickmerge Fehler:", e)
+        warn(f"brickmerge Fehler: {e}")
     return deals
 
 
 def scan_new_sets(seen):
-    deals = fetch_mydealz() + fetch_brickmerge()
+    md = fetch_mydealz()
+    bm = fetch_brickmerge()
+    deals = md + bm
+    new_count = sum(1 for d in deals if f"NEW_{d['cands'][0]}_{d['price']}" not in seen)
+    sent_count = 0
+    STATS["mydealz"], STATS["brickmerge"], STATS["new"] = len(md), len(bm), new_count
+    print(
+        f"Neuware: mydealz {len(md)} Angebote mit Setnummer+Preis, "
+        f"brickmerge {len(bm)}"
+        + ("" if BRICKMERGE_TG_CHANNEL else " (Kanal nicht gesetzt, übersprungen)")
+        + f"; davon neu: {new_count}"
+    )
 
     for d in deals:
         try:
@@ -292,6 +319,7 @@ def scan_new_sets(seen):
 
             set_num, set_info = resolve_set(d["cands"])
             if not set_info:
+                STATS["unresolved"] += 1
                 continue  # nicht als gesehen markieren -> nächster Lauf versucht es erneut
 
             set_name = set_info.get("name", d["title"])
@@ -319,6 +347,7 @@ def scan_new_sets(seen):
                 seen.add(deal_id)
                 continue
 
+            STATS["rated"] += 1
             margin_ratio = d["price"] / est_pov
             pov_rate = est_pov / d["price"]
             is_good_pov = margin_ratio <= 0.40
@@ -352,8 +381,12 @@ def scan_new_sets(seen):
             )
             if send_telegram(msg):
                 seen.add(deal_id)  # erst nach erfolgreichem Senden als gesehen markieren
+                sent_count += 1
+                STATS["sent"] += 1
         except Exception as e:
-            print("Fehler bei Deal", d.get("title", "?")[:60], ":", e)
+            warn(f"Fehler bei Deal {d.get('title', '?')[:40]}: {e}")
+
+    print(f"Neuware: {sent_count} Nachricht(en) gesendet")
 
 
 IMAGE_MIMES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
@@ -469,13 +502,25 @@ def looks_like_lego(subject, text):
 # MODUL 2: GEBRAUCHTWARE KI-SCANNER (Kleinanzeigen / eBay Alerts)
 # ==========================================
 def scan_used_lots(seen):
-    if not (AI_API_KEY and GMAIL_USER and GMAIL_APP_PASSWORD):
+    missing = [
+        name
+        for name, val in (
+            (AI_KEY_ENV.get(AI_PROVIDER, "KI-Key"), AI_API_KEY),
+            ("GMAIL_USER", GMAIL_USER),
+            ("GMAIL_APP_PASSWORD", GMAIL_APP_PASSWORD),
+        )
+        if not val
+    ]
+    if missing:
+        print("Gebrauchtware übersprungen, fehlende Secrets:", ", ".join(missing))
+        STATS["used"] = "übersprungen, Secrets fehlen: " + ", ".join(missing)
         return
+    print(f"Gebrauchtware: KI-Anbieter {AI_PROVIDER}, Modell {AI_MODEL}")
 
     try:
         client = make_ai_client()
     except Exception as e:
-        print("KI-Client Fehler:", e)
+        warn(f"KI-Client Fehler: {e}")
         return
     mail = None
     try:
@@ -485,9 +530,14 @@ def scan_used_lots(seen):
 
         status, messages = mail.search(None, "UNSEEN")
         if status != "OK" or not messages or not messages[0]:
+            print("Gebrauchtware: keine ungelesenen Mails im Posteingang")
+            STATS["used"] = "keine ungelesenen Mails"
             return
 
         email_ids = messages[0].split()[-10:]
+        print(f"Gebrauchtware: {len(email_ids)} ungelesene Mail(s) werden geprüft")
+        STATS["used"] = "ran"
+        STATS["mail_unread"] = len(email_ids)
 
         for e_id in email_ids:
             try:
@@ -540,6 +590,7 @@ def scan_used_lots(seen):
                     continue
 
                 if USED_PREFILTER and not looks_like_lego(subject, clean_text):
+                    STATS["mail_filtered"] += 1
                     seen.add(unique_key)
                     mail.store(e_id, "+FLAGS", "\\Seen")
                     continue
@@ -574,6 +625,7 @@ def scan_used_lots(seen):
                 if result is None:
                     continue  # nicht als gesehen markieren, nächster Lauf versucht es erneut
 
+                STATS["mail_rated"] += 1
                 if result.get("is_good_deal"):
                     best_link = html.unescape(ad_links[0]) if ad_links else "https://www.kleinanzeigen.de"
                     telegram_msg = (
@@ -586,13 +638,14 @@ def scan_used_lots(seen):
                     )
                     if not send_telegram(telegram_msg):
                         continue  # Senden fehlgeschlagen: Mail bleibt ungelesen, nächster Lauf versucht es erneut
+                    STATS["mail_sent"] += 1
 
                 seen.add(unique_key)
                 mail.store(e_id, "+FLAGS", "\\Seen")
             except Exception as e:
-                print("Fehler bei Mail", e_id, ":", e)
+                warn(f"Fehler bei Mail {e_id!r}: {str(e)[:120]}")
     except Exception as e:
-        print("Gebrauchtware-Scanner Fehler:", e)
+        warn(f"Gebrauchtware-Scanner Fehler: {e}")
     finally:
         if mail is not None:
             try:
@@ -601,8 +654,54 @@ def scan_used_lots(seen):
                 pass
 
 
+def send_heartbeat():
+    """Stumme Status-Nachricht nach jedem Lauf (abschaltbar mit NOTIFY_EVERY_RUN=0)."""
+    if not NOTIFY_EVERY_RUN:
+        return
+    try:
+        from zoneinfo import ZoneInfo
+        from datetime import datetime
+
+        zeit = datetime.now(ZoneInfo("Europe/Berlin")).strftime("%d.%m. %H:%M")
+    except Exception:
+        from datetime import datetime, timezone
+
+        zeit = datetime.now(timezone.utc).strftime("%d.%m. %H:%M UTC")
+
+    st = STATS
+    bm_txt = f"brickmerge {st['brickmerge']}" if BRICKMERGE_TG_CHANNEL else "brickmerge aus"
+    lines = [
+        f"🔎 <b>Scan beendet</b> · {zeit}",
+        f"📦 Neuware: mydealz {st['mydealz']}, {bm_txt} · neu {st['new']} · "
+        f"bewertet {st['rated']} · gemeldet {st['sent']}",
+    ]
+    if st["used"] == "ran":
+        lines.append(
+            f"♻️ Gebrauchtware: {st['mail_unread']} Mail(s), {st['mail_filtered']} vorgefiltert, "
+            f"{st['mail_rated']} bewertet, {st['mail_sent']} gemeldet"
+        )
+    else:
+        lines.append(f"♻️ Gebrauchtware: {esc(st['used'])}")
+    if st["sent"] + st["mail_sent"] == 0:
+        lines.append("Kein Deal in diesem Lauf.")
+    if st["warnings"]:
+        lines.append("⚠️ <b>Probleme:</b>")
+        lines += [f"• {esc(w)}" for w in st["warnings"][:5]]
+    send_telegram("\n".join(lines), silent=True)
+
+
 if __name__ == "__main__":
+    # Testnachricht beim manuellen Start, falls die Status-Nachrichten abgeschaltet sind
+    if not NOTIFY_EVERY_RUN and (
+        os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.environ.get("SEND_TEST") == "1"
+    ):
+        ok = send_telegram("✅ <b>LEGO-Scanner:</b> Testnachricht, Telegram funktioniert.")
+        print("Testnachricht gesendet:", ok)
     seen = Seen(load_seen())
-    scan_new_sets(seen)
-    scan_used_lots(seen)
+    for scan in (scan_new_sets, scan_used_lots):
+        try:
+            scan(seen)
+        except Exception as e:
+            warn(f"{scan.__name__} abgebrochen: {e}")
     save_seen(seen.items)
+    send_heartbeat()
