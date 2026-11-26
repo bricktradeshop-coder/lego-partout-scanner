@@ -1,4 +1,4 @@
-name: LEGO 24/7 Part-Out Scanner
+me: LEGO 24/7 Part-Out Scanner
 
 on:
   schedule:
