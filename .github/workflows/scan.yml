@@ -1,4 +1,4 @@
-me: LEGO 24/7 Part-Out Scanner
+name: LEGO 24/7 Part-Out Scanner
 
 on:
   schedule:
@@ -52,6 +52,7 @@ jobs:
           AI_PROVIDER: ${{ vars.AI_PROVIDER }}
           AI_MODEL: ${{ vars.AI_MODEL }}
           USED_PREFILTER: ${{ vars.USED_PREFILTER }}
+          NOTIFY_EVERY_RUN: ${{ vars.NOTIFY_EVERY_RUN }}
         run: python lego_scanner.py
 
       - name: Gesehene Deals speichern (Anti-Duplikat)
