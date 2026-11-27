@@ -180,7 +180,8 @@ def parse_price(s):
     return float(s)
 
 
-PRICE_RE = re.compile(r"(\d[\d.]*(?:,\d{1,2})?)\s*€")
+PRICE_RE = re.compile(r"(\d[\d.]*(?:,\d{1,2})?)\s*(?:€|Euro\b|EUR\b)")
+POV_RE = re.compile(r"(?:Part-Out-Value|POV)\s*:?\s*(?:ca\.?)?\s*(\d[\d.]*(?:,\d{1,2})?)\s*€")
 
 
 def set_candidates(text, price=None):
@@ -247,11 +248,15 @@ def fetch_mydealz():
             warn(f"mydealz: HTTP {r.status_code}")
             return deals
         root = ET.fromstring(r.content)
-        for item in root.findall(".//item")[:15]:
+        for item in root.findall(".//item")[:40]:
             title_el = item.find("title")
             link_el = item.find("link")
+            desc_el = item.find("description")
             title = (title_el.text or "") if title_el is not None else ""
             link = (link_el.text or "") if link_el is not None else ""
+            desc = ""
+            if desc_el is not None and desc_el.text:
+                desc = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]*?>", " ", html.unescape(desc_el.text))))
             price_m = PRICE_RE.search(title)
             if not price_m:
                 continue
@@ -259,7 +264,18 @@ def fetch_mydealz():
                 price = parse_price(price_m.group(1))
             except ValueError:
                 continue
-            cands = set_candidates(title, price)
+            cands = explicit_set_numbers(desc)
+            for c in set_candidates(title, price):
+                if c not in cands:
+                    cands.append(c)
+            cands = cands[:3]
+            pov = None
+            pov_m = POV_RE.search(desc)  # Brickmerge-Daten im Deal-Text: "POV: ca. 102,83 €"
+            if pov_m:
+                try:
+                    pov = parse_price(pov_m.group(1))
+                except ValueError:
+                    pov = None
             if cands:
                 deals.append(
                     {
@@ -267,7 +283,7 @@ def fetch_mydealz():
                         "title": title,
                         "cands": cands,
                         "price": price,
-                        "bm_pov": None,
+                        "bm_pov": pov,
                         "link": link,
                     }
                 )
@@ -314,10 +330,8 @@ def fetch_brickmerge():
             msg = re.sub(r"^[^<>]*>", "", msg, count=1)  # Rest des öffnenden Tags entfernen
             raw = html.unescape(msg)
             text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]*?>", " ", msg)))
-            price_m = re.search(r"(?:ab|für|Preis:)\s*(\d[\d.]*(?:,\d{1,2})?)\s*€", text)
-            pov_m = re.search(
-                r"(?:Part-Out-Value|POV)\s*:?\s*(?:ca\.?)?\s*(\d[\d.]*(?:,\d{1,2})?)\s*€", text
-            )
+            price_m = re.search(r"(?:ab|für|Preis:)\s*(\d[\d.]*(?:,\d{1,2})?)\s*(?:€|Euro\b)", text)
+            pov_m = POV_RE.search(text)
             link_m = re.search(
                 r"(https://(?:brckmrg\.de|(?:www\.)?brickmerge\.de)/[a-zA-Z0-9\-_/]+)", raw
             )
