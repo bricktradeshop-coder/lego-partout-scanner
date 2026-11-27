@@ -691,10 +691,8 @@ def send_heartbeat():
 
 
 if __name__ == "__main__":
-    # Testnachricht beim manuellen Start, falls die Status-Nachrichten abgeschaltet sind
-    if not NOTIFY_EVERY_RUN and (
-        os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.environ.get("SEND_TEST") == "1"
-    ):
+    # Testnachricht (mit Ton) bei jedem manuellen Start ("Run workflow") oder mit SEND_TEST=1
+    if os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch" or os.environ.get("SEND_TEST") == "1":
         ok = send_telegram("✅ <b>LEGO-Scanner:</b> Testnachricht, Telegram funktioniert.")
         print("Testnachricht gesendet:", ok)
     seen = Seen(load_seen())
