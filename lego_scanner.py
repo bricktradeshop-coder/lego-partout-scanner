@@ -121,11 +121,20 @@ def send_telegram(msg, silent=False):
     global _tg_down
     if _tg_down:
         return False
-    if not TG_TOKEN_OK or not TELEGRAM_CHAT_ID:
-        print(
-            "Telegram Fehler: TELEGRAM_TOKEN oder TELEGRAM_CHAT_ID ist leer bzw. hat ein ungültiges Format "
-            "(Token muss wie 123456789:ABC-def aussehen, Secret-Namen exakt prüfen)"
+    problems = []
+    if not TELEGRAM_TOKEN:
+        problems.append("TELEGRAM_TOKEN ist LEER (Secret fehlt, falscher Name oder falscher Ort)")
+    elif not TG_TOKEN_OK:
+        problems.append(
+            f"TELEGRAM_TOKEN hat ein ungültiges Format (Länge {len(TELEGRAM_TOKEN)}, "
+            f"Doppelpunkt vorhanden: {'ja' if ':' in TELEGRAM_TOKEN else 'nein'}; "
+            "erwartet wird Zahl:Buchstaben, z.B. 123456789:ABC-def)"
         )
+    if not TELEGRAM_CHAT_ID:
+        problems.append("TELEGRAM_CHAT_ID ist LEER (Secret fehlt, falscher Name oder falscher Ort)")
+    if problems:
+        for pr in problems:
+            print("Telegram Fehler:", pr)
         _tg_down = True
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -267,21 +276,51 @@ def fetch_mydealz():
     return deals
 
 
+def explicit_set_numbers(text):
+    """Setnummern aus eindeutigen Mustern: 'Artikel-Nr: 40806' oder 'brickmerge.de/40806-1'."""
+    out = []
+    for pat in (r"Artikel-Nr:\s*(\d{4,5})", r"brickmerge\.de/(\d{4,5})-1"):
+        for m in re.finditer(pat, text):
+            if m.group(1) not in out:
+                out.append(m.group(1))
+    return out
+
+
 def fetch_brickmerge():
     deals = []
     if not BRICKMERGE_TG_CHANNEL:
         return deals
     try:
-        r = requests.get(f"https://t.me/s/{BRICKMERGE_TG_CHANNEL}", headers=UA, timeout=15)
-        if r.status_code != 200:
-            warn(f"brickmerge: HTTP {r.status_code}")
+        page = None
+        # t.me war im Juli 2026 zeitweise nicht erreichbar -> telegram.me als Ausweichadresse
+        for host in ("t.me", "telegram.me"):
+            try:
+                r = requests.get(f"https://{host}/s/{BRICKMERGE_TG_CHANNEL}", headers=UA, timeout=15)
+            except Exception as e:
+                warn(f"brickmerge ({host}): {e}")
+                continue
+            if r.status_code == 200:
+                page = r.text
+                break
+            warn(f"brickmerge ({host}): HTTP {r.status_code}")
+        if page is None:
             return deals
-        messages = r.text.split("tgme_widget_message_text")[-10:]
+        if "tgme_widget_message_text" not in page:
+            warn("brickmerge: keine Beiträge gefunden (Kanalname falsch oder Web-Vorschau deaktiviert)")
+            return deals
+
+        messages = page.split("tgme_widget_message_text")[-10:]
         for msg in messages:
+            msg = re.sub(r"^[^<>]*>", "", msg, count=1)  # Rest des öffnenden Tags entfernen
+            raw = html.unescape(msg)
             text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]*?>", " ", msg)))
-            price_m = re.search(r"(?:ab|für)\s+(\d[\d.]*(?:,\d{1,2})?)\s*€", text)
-            pov_m = re.search(r"Part-Out-Value:\s*ca\.\s*(\d[\d.]*(?:,\d{1,2})?)\s*€", text)
-            link_m = re.search(r"(https://brckmrg\.de/[a-zA-Z0-9\-_/]+)", text)
+            price_m = re.search(r"(?:ab|für|Preis:)\s*(\d[\d.]*(?:,\d{1,2})?)\s*€", text)
+            pov_m = re.search(
+                r"(?:Part-Out-Value|POV)\s*:?\s*(?:ca\.?)?\s*(\d[\d.]*(?:,\d{1,2})?)\s*€", text
+            )
+            link_m = re.search(
+                r"(https://(?:brckmrg\.de|(?:www\.)?brickmerge\.de)/[a-zA-Z0-9\-_/]+)", raw
+            )
             if not price_m:
                 continue
             try:
@@ -289,7 +328,11 @@ def fetch_brickmerge():
                 pov = parse_price(pov_m.group(1)) if pov_m else None
             except ValueError:
                 continue
-            cands = set_candidates(text, price)
+            cands = explicit_set_numbers(text)
+            for c in set_candidates(text, price):
+                if c not in cands:
+                    cands.append(c)
+            cands = cands[:3]
             if not cands:
                 continue
             deals.append(
@@ -299,7 +342,7 @@ def fetch_brickmerge():
                     "cands": cands,
                     "price": price,
                     "bm_pov": pov,
-                    "link": link_m.group(1) if link_m else f"https://brickmerge.de/{cands[0]}-1",
+                    "link": link_m.group(1) if link_m else f"https://www.brickmerge.de/{cands[0]}-1",
                 }
             )
     except Exception as e:
