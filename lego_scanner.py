@@ -12,8 +12,11 @@ import requests
 import xml.etree.ElementTree as ET
 
 REBRICKABLE_KEY = os.environ["REBRICKABLE_KEY"]
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "").strip().strip("\"'").strip()
+if TELEGRAM_TOKEN.startswith("bot"):  # häufiger Fehler: "bot" vor dem Token mitkopiert
+    TELEGRAM_TOKEN = TELEGRAM_TOKEN[3:]
+TG_TOKEN_OK = bool(re.fullmatch(r"\d+:[A-Za-z0-9_-]+", TELEGRAM_TOKEN))
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip("\"'").strip()
 GMAIL_USER = os.environ.get("GMAIL_USER", "")
 GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
 
@@ -117,6 +120,13 @@ def send_telegram(msg, silent=False):
     """Sendet eine Nachricht. Gibt True zurück, wenn Telegram sie angenommen hat."""
     global _tg_down
     if _tg_down:
+        return False
+    if not TG_TOKEN_OK or not TELEGRAM_CHAT_ID:
+        print(
+            "Telegram Fehler: TELEGRAM_TOKEN oder TELEGRAM_CHAT_ID ist leer bzw. hat ein ungültiges Format "
+            "(Token muss wie 123456789:ABC-def aussehen, Secret-Namen exakt prüfen)"
+        )
+        _tg_down = True
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
